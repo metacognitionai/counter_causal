@@ -90,6 +90,17 @@ def _apply_rope(q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.
 # Generation loop
 # ---------------------------------------------------------------------------
 
+def _eos_ids(model, tokenizer) -> frozenset:
+    """The token ids that end generation, as transformers' generate takes them: the model's
+    generation_config.eos_token_id (Llama-3.1-Instruct: <|end_of_text|>, <|eom_id|>, <|eot_id|>)
+    and the tokenizer's eos token."""
+    ids = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
+    ids = set() if ids is None else ({ids} if isinstance(ids, int) else set(ids))
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        ids.add(tokenizer.eos_token_id)
+    return frozenset(ids)
+
+
 def generate_with_kv_hook(
     model,
     tokenizer,
@@ -105,7 +116,7 @@ def generate_with_kv_hook(
 
     Args:
         model:          HuggingFace causal LM.
-        tokenizer:      Corresponding tokenizer (used for eos_token_id and decoding).
+        tokenizer:      Corresponding tokenizer (used for its eos token and decoding).
         input_ids:      Prompt token ids, shape [1, prompt_len].
         max_new_tokens: Maximum tokens to generate.
         chunk_size:     Tokens processed between hook invocations.
@@ -164,8 +175,11 @@ def generate_with_kv_hook(
         next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
         current_pos = input_ids.shape[1]
         generated = [next_token.item()]
+        eos = _eos_ids(model, tokenizer)
 
         for step in tqdm(range(1, max_new_tokens), desc="Decode", leave=False):
+            if generated[-1] in eos:
+                break
             pos_ids = torch.tensor([[current_pos]], device=model.device, dtype=torch.long)
             with torch.no_grad():
                 out = model(input_ids=next_token, past_key_values=state.kv, position_ids=pos_ids, use_cache=True)
@@ -183,8 +197,6 @@ def generate_with_kv_hook(
             if kv_hook and refresh_mode == 'chunked' and (input_ids.shape[1] + step) % chunk_size == 0:
                 state = kv_hook(state)
 
-            if tok == tokenizer.eos_token_id:
-                break
             if stop_fn and stop_fn(generated):
                 break
 
